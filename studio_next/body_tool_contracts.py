@@ -8,9 +8,13 @@ from __future__ import annotations
 
 _ARG_TYPES={
     "source":"string","source_svg":"string","source_film":"string",
+    "asset_id":"string","attestation_id":"string",
     "scene_json":"string","original_film_ir":"string","voice_assets":"string",
-    "assets_root":"string","edit":"string","plan":"string","video_job":"string","out":"string",
+    "assets_root":"string","edit":"string","plan":"string","operation":"string","video_job":"string","out":"string",
     "width":"integer","height":"integer","fps":"integer",
+    "bundle":"string","bundle_sha256":"string","frame_index":"integer",
+    "before_bundle":"string","before_sha256":"string",
+    "after_bundle":"string","after_sha256":"string",
     "time_seconds":"number","expected":"object","source_witness":"object",
 }
 _EXAMPLES_DISALLOWED=True
@@ -33,6 +37,7 @@ def real_operation_schema(tool_id,required):
     optional={
         "body.motion2d":("voice_assets",),
         "body.blender3d":("assets_root",),
+        "body.exr_passes":("assets_root",),
         "body.full_decode":("expected",),
     }.get(tool_id,())
     for name in optional:

@@ -1,0 +1,200 @@
+name: "ZX7 BODY — Integrated Mobile + Native Release Proof"
+on:
+  workflow_dispatch:
+  push:
+    branches: [zx7-body/mobile-operator-20261021]
+    paths:
+      - "studio_next/**"
+      - ".github/workflows/studio-body-release-proof.yml"
+      - "pyproject.toml"
+      - ".github/workflows/studio-body-mobile-full-proof.yml"
+      - "studio_next/body_mobile.py"
+      - "studio_next/precision_retime.py"
+      - "studio_next/body_archive.py"
+      - "studio_next/test_body_archive.py"
+      - "studio_next/body_portability.py"
+      - "studio_next/body_asset_links.py"
+      - "studio_next/body_verified_delivery.py"
+      - "studio_next/body_stage_lease.py"
+      - "studio_next/body_host_resources.py"
+      - "studio_next/test_body_host_resources.py"
+      - "studio_next/test_body_stage_lease.py"
+      - "studio_next/durable_graph.py"
+      - "studio_next/body_dependency_scope.py"
+      - "studio_next/body_revision_impact.py"
+      - "studio_next/body_color_pipeline.py"
+      - "studio_next/body_exr_passes.py"
+      - "studio_next/body_frame_resume.py"
+      - "studio_next/body_observation.py"
+      - "studio_next/body_review_access.py"
+      - "studio_next/body_review_compare.py"
+      - "studio_next/test_body_review_compare.py"
+      - "studio_next/test_body_review_access.py"
+      - "studio_next/test_body_observation.py"
+      - "studio_next/test_body_frame_resume.py"
+      - "studio_next/blender_scene.py"
+      - "studio_next/test_body_exr_passes.py"
+      - "studio_next/blender_scene.py"
+      - "pyproject.toml"
+      - "studio_next/test_body_chroma_vfx.py"
+      - "studio_next/composite_mix.py"
+      - "studio_next/test_body_audio_automation.py"
+      - "studio_next/body_loudness.py"
+      - "studio_next/test_body_loudness.py"
+      - "studio_next/test_body_color_pipeline.py"
+      - "studio_next/body_integration.py"
+      - "studio_next/body_materials.py"
+      - "studio_next/test_body_revision_http.py"
+      - "studio_next/body_revision_impact.py"
+      - "studio_next/test_body_revision_impact.py"
+      - "studio_next/test_body_incremental_cinema.py"
+      - "studio_next/test_body_dependency_scope.py"
+      - "studio_next/film_ir.py"
+      - "studio_next/test_body_verified_delivery.py"
+      - "studio_next/test_body_asset_identity.py"
+      - "studio_next/test_body_asset_uri.py"
+      - "studio_next/composite_mix.py"
+      - "studio_next/body_tool_contracts.py"
+      - "studio_next/test_body_asset_links.py"
+      - "studio_next/test_body_portability.py"
+      - "studio_next/creative_tool_registry.py"
+      - "studio_next/test_creative_tool_registry.py"
+      - "studio_next/test_precision_retime.py"
+      - "studio_next/body_sequence_cuts.py"
+      - "studio_next/test_body_sequence_cuts.py"
+      - "studio_next/body_owned_edit.py"
+      - "studio_next/test_body_owned_edit.py"
+      - "studio_next/test_body_integration.py"
+      - "studio_next/body_native_proof.py"
+      - "studio_next/body_affordances.py"
+      - "studio_next/body_signal.py"
+      - "studio_next/test_body_signal.py"
+      - "studio_next/test_body_affordances.py"
+      - "studio_next/body_sensory.py"
+      - "studio_next/test_body_sensory.py"
+      - "studio_next/body_timeline_revision.py"
+      - "studio_next/test_body_timeline_revision.py"
+      - "studio_next/body_integration.py"
+      - "studio_next/body_materials.py"
+      - "studio_next/body_download_tickets.py"
+      - "studio_next/test_body_download_tickets.py"
+      - "studio_next/body_service.py"
+      - "studio_next/test_body_mobile.py"
+      - "studio_next/body_publication.py"
+      - "studio_next/durable_sqlite.py"
+      - "studio_next/body_desktop.py"
+      - "studio_next/body_integration.py"
+      - "studio_next/body_materials.py"
+      - "studio_next/motion_bridge.py"
+      - "motion_studio/render.py"
+      - "studio_next/test_body_controls.py"
+      - "studio_next/test_body_publication.py"
+      - "studio_next/test_body_desktop.py"
+# Free runner minutes: superseded same-branch proof runs cannot waste native compute.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  actual-installed-original-media-body:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install actual free native media tools and physical desktop display
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y blender ffmpeg inkscape xvfb python3-tk fonts-dejavu-core fonts-noto-core
+          python -m pip install --no-cache-dir "numpy>=1.26,<3" "Pillow>=10,<13" "opentimelineio>=0.17,<1" "fonttools>=4,<5" "OpenEXR>=3.3,<4" "opencolorio>=2.5,<2.6"
+      - name: Verify complete contracts, real process death, pause/restart/resume and actual graphical client
+        env:
+          ZX7_DESKTOP_QA_PNG: ${{ github.workspace }}/output/body-release-proof/desktop-qa.png
+          ZX7_INCREMENTAL_CINEMA_PROOF: ${{ github.workspace }}/output/body-release-proof/incremental-cinema
+          ZX7_COLOR_VFX_PROOF: ${{ github.workspace }}/output/body-release-proof/color-vfx-proven
+          ZX7_EXR_VFX_PROOF: ${{ github.workspace }}/output/body-release-proof/linear-exr-proven
+          ZX7_OBSERVATION_PROOF: ${{ github.workspace }}/output/body-release-proof/actual-director-review
+        run: |
+          mkdir -p output/body-release-proof
+          python -m compileall -q studio_next motion_studio
+          set -o pipefail
+          xvfb-run -a python -m unittest discover -s studio_next -p 'test_*.py' -v 2>&1 | tee output/body-release-proof/all-tests.log
+      - name: Build and install the actual wheel into a separate Python environment
+        run: |
+          python -m pip wheel --no-deps --wheel-dir output/body-release-proof/wheels .
+          python -m venv --system-site-packages "$RUNNER_TEMP/zx7-body-installed"
+          "$RUNNER_TEMP/zx7-body-installed/bin/python" -m pip install --no-deps output/body-release-proof/wheels/*.whl
+          python -m venv "$RUNNER_TEMP/zx7-body-minimal"
+          "$RUNNER_TEMP/zx7-body-minimal/bin/python" -m pip install --no-deps output/body-release-proof/wheels/*.whl
+          "$RUNNER_TEMP/zx7-body-minimal/bin/python" -I - <<'PY'
+          import tempfile
+          from studio_next.body_integration import body_catalog
+          with tempfile.TemporaryDirectory() as root:
+              installed={x['id']:x for x in body_catalog(root).discover()}
+              assert installed['body.motion2d']['status']=='needs_setup',installed
+          print('MINIMAL INSTALLED WHEEL DOES NOT CLAIM ABSENT RENDERER LIBRARIES')
+          PY
+      - name: Installed package independently renders original 3D, 2D, sound, editable cut and full decoded MP4
+        working-directory: ${{ runner.temp }}
+        run: |
+          "$RUNNER_TEMP/zx7-body-installed/bin/python" - <<'PY'
+          from pathlib import Path
+          import os, studio_next
+          installed=Path(studio_next.__file__).resolve()
+          assert not installed.is_relative_to(Path(os.environ['GITHUB_WORKSPACE']).resolve()), installed
+          print('ACTUAL SEPARATELY INSTALLED BODY PACKAGE',installed)
+          PY
+          "$RUNNER_TEMP/zx7-body-installed/bin/python" -u -m studio_next.body_native_proof --out "$GITHUB_WORKSPACE/output/body-release-proof/native"
+          "$RUNNER_TEMP/zx7-body-installed/bin/zx7-client" --help
+          "$RUNNER_TEMP/zx7-body-installed/bin/zx7-desktop" --help
+          "$RUNNER_TEMP/zx7-body-installed/bin/zx7-archive" --help
+          "$RUNNER_TEMP/zx7-body-installed/bin/zx7-relink-otio" --help
+      - name: Save exact release evidence without certifying artistic quality
+        run: |
+          python - <<'PY'
+          import hashlib,json,os,re,sqlite3
+          from pathlib import Path
+          root=Path('output/body-release-proof')
+          log=(root/'all-tests.log').read_text()
+          match=re.search(r'Ran (\d+) tests',log)
+          statuses=[line for line in log.splitlines()
+                    if line in ('OK','OK (skipped=1)')]
+          assert match and len(statuses)==1,log[-2000:]
+          skipped=[line for line in log.splitlines() if ' ... skipped ' in line]
+          if statuses[0]=='OK (skipped=1)':
+              assert len(skipped)==1 and 'test_browser_owner_media_job_tools_and_one_use_exact_download' in skipped[0],skipped
+          else:
+              assert not skipped,skipped
+          physical=json.loads((root/'native/verified-native-body-result.json').read_text())
+          assert physical['real_3d_rendered'] and physical['real_2d_rendered']
+          assert physical['exact_all_nodes_resumed']
+          assert (root/'desktop-qa.png').is_file()
+          release={
+            'source_commit':os.environ['GITHUB_SHA'],
+            'tests_passed':int(match[1]),
+            'actual_gui_and_authenticated_media_roundtrip':True,
+            'actual_process_death_publication_recovery_without_rerender':True,
+            'actual_pause_restart_and_original_job_resume':True,
+            'separately_installed_wheel_native_2d_3d_audio_otio_mp4':True,
+            'sqlite_runtime':sqlite3.sqlite_version,
+            'gpu_video_generation_verified':False,
+            'independent_premium_artist_or_original_fold_film_proven':False,
+            'artifacts':[
+              {'path':str(p.relative_to(root)),'bytes':p.stat().st_size,
+               'sha256':hashlib.file_digest(p.open('rb'),'sha256').hexdigest()}
+              for p in root.rglob('*') if p.is_file()]
+          }
+          (root/'verified-release-evidence.json').write_text(json.dumps(release,indent=2)+'\n')
+          print(json.dumps(release,indent=2))
+          PY
+      - name: Retain real installer, original media, editable project and GUI/test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zx7-integrated-mobile-native-body-proof
+          path: output/body-release-proof/
+          if-no-files-found: warn
+          retention-days: 7

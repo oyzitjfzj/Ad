@@ -23,7 +23,8 @@ _RIGHTS={"owner_supplied","generated_original","appropriately_licensed"}
 _ALLOWED_MIME={"image/png","image/jpeg","image/webp","image/svg+xml",
  "image/x-exr","video/mp4","video/quicktime","video/webm",
  "audio/wav","audio/mpeg","audio/flac","font/ttf","font/otf",
- "model/gltf-binary","application/octet-stream"}
+ "model/gltf-binary","application/octet-stream",
+ "application/x-zx7-exr-bundle"}
 class MediaCustodyError(ValueError):
     pass
 
@@ -37,7 +38,16 @@ def verify_media_container(path,mime):
         from .delivery_audit import _probe_details
         import subprocess
         try:
-            return _probe_details(path)
+            observed=_probe_details(path)
+            decoded=subprocess.run([
+                "ffmpeg","-hide_banner","-loglevel","error","-nostdin",
+                "-xerror","-i",str(path),"-map","0:v:0",
+                "-map","0:a:0?","-f","null","-"],
+                capture_output=True,timeout=3600,check=False)
+            if decoded.returncode!=0:
+                raise MediaCustodyError(
+                    "Original video failed complete physical picture/audio decode")
+            return observed
         except (OSError,ValueError,RuntimeError,subprocess.SubprocessError) as exc:
             # Source footage failures are an ordinary untrusted upload error,
             # not an uncaught internal server exception or valid asset.
@@ -79,16 +89,187 @@ def verify_media_container(path,mime):
             with wave.open(str(path),"rb") as audio:
                 if audio.getnframes()<1 or audio.getframerate()<1:
                     raise MediaCustodyError("Decoded sound file has no actual samples")
+                expected=(audio.getnframes()*audio.getnchannels()*
+                          audio.getsampwidth())
+                counted=0
+                while True:
+                    block=audio.readframes(65536)
+                    if not block:break
+                    counted+=len(block)
+                if counted!=expected:
+                    raise MediaCustodyError(
+                        "Original WAV claimed more PCM samples than physically recorded")
         except wave.Error as exc:
             raise MediaCustodyError("WAV identity is not backed by actual PCM") from exc
     elif mime=="image/svg+xml":
         from .creative_asset_ops import validate_original_svg_art
         validate_original_svg_art(path)
+    elif mime in ("font/ttf","font/otf"):
+        # Source owners can attest a font license only after actual sfnt glyph
+        # metadata parses. A four-byte sfnt signature or fabricated name
+        # table is not proof of an artist-usable text shaping resource.
+        import importlib.util
+        if importlib.util.find_spec("fontTools") is None:
+            raise MediaCustodyError("Native font source decoder not installed")
+        from fontTools.ttLib import TTFont,TTLibError
+        with path.open("rb") as actual_font:
+            signature=actual_font.read(4)
+        if ((mime=="font/ttf" and signature not in (
+                    bytes((0,1,0,0)),b"true"))
+                or (mime=="font/otf" and signature!=b"OTTO")):
+            raise MediaCustodyError("Original font sfnt container does not match MIME")
+        try:
+            with TTFont(str(path),lazy=False,recalcBBoxes=False) as face:
+                cmap=face.getBestCmap()
+                if (not isinstance(cmap,dict) or not cmap
+                        or not 1<=face["maxp"].numGlyphs<=200000
+                        or not 16<=face["head"].unitsPerEm<=16384):
+                    raise MediaCustodyError(
+                        "Original typeface has no real Unicode glyph metrics")
+        except (OSError,ValueError,KeyError,TTLibError,AssertionError,
+                IndexError,TypeError) as exc:
+            raise MediaCustodyError(
+                "Original claimed typeface failed native font table/glyph inspection") from exc
     elif mime=="model/gltf-binary":
-        with path.open("rb") as f:
-            first=f.read(12)
-        if len(first)!=12 or first[:4]!=b"glTF":
-            raise MediaCustodyError("Claimed 3D GLB is not a real binary scene")
+        # glTF v2 GLB is a precisely chunked binary container, not twelve
+        # bytes beginning with "glTF". Verify actual JSON scene metadata and
+        # every chunk boundary before granting source rights. This verifies
+        # binary structure, NOT artistic geometry, UVs, shader or render quality.
+        import struct
+        size=path.stat().st_size
+        if size<32 or size>2*1024*1024*1024:
+            raise MediaCustodyError("Original GLB has no bounded complete scene")
+        try:
+            with path.open("rb") as scene:
+                magic,version,declared=struct.unpack("<4sII",scene.read(12))
+                if magic!=b"glTF" or version!=2 or declared!=size:
+                    raise MediaCustodyError("Original GLB header/version/size is false")
+                visited=12
+                first_json=None
+                chunks=0
+                has_binary=False
+                binary_chunk_bytes=None
+                while visited<size:
+                    header=scene.read(8)
+                    if len(header)!=8:
+                        raise MediaCustodyError("Truncated original GLB chunk header")
+                    length,kind=struct.unpack("<I4s",header)
+                    visited+=8
+                    if length%4!=0 or length>size-visited or chunks>=64:
+                        raise MediaCustodyError("Invalid native GLB chunk boundary")
+                    if chunks==0:
+                        if kind!=b"JSON" or not 4<=length<=8*1024*1024:
+                            raise MediaCustodyError("GLB has no bounded native JSON scene")
+                        first_json=json.loads(scene.read(length).rstrip(bytes((32,9,13,10,0))))
+                        if not isinstance(first_json,dict):
+                            raise MediaCustodyError("GLB scene description is not JSON")
+                    else:
+                        if kind==b"JSON" or (kind==bytes((66,73,78,0)) and has_binary):
+                            raise MediaCustodyError("GLB has duplicate scene or binary chunks")
+                        if kind==bytes((66,73,78,0)):
+                            has_binary=True
+                            binary_chunk_bytes=length
+                        scene.seek(length,1)
+                    visited+=length
+                    chunks+=1
+                if visited!=size:
+                    raise MediaCustodyError("Native GLB file contains undeclared bytes")
+                if (not isinstance(first_json,dict)
+                        or first_json.get("asset",{}).get("version")!="2.0"
+                        or not isinstance(first_json.get("scenes"),list)
+                        or not first_json["scenes"]
+                        or not isinstance(first_json.get("nodes"),list)
+                        or not first_json["nodes"]
+                        or not (first_json.get("meshes") or first_json.get("cameras"))):
+                    raise MediaCustodyError(
+                        "Original GLB lacks a real scene graph and authored geometry/camera")
+                buffers=first_json.get("buffers",[])
+                if not isinstance(buffers,list):
+                    raise MediaCustodyError("Original GLB has malformed buffer references")
+                if buffers:
+                    if len(buffers)!=1 or not has_binary:
+                        raise MediaCustodyError("GLB describes missing required binary source")
+                    buffer=buffers[0]
+                    if (not isinstance(buffer,dict) or
+                            type(buffer.get("byteLength")) is not int or
+                            buffer["byteLength"]<1 or
+                            "uri" in buffer or
+                            not buffer["byteLength"]<=binary_chunk_bytes<=
+                                 buffer["byteLength"]+3):
+                        raise MediaCustodyError(
+                            "Original GLB binary payload differs from its scene graph")
+                    for view in first_json.get("bufferViews",[]):
+                        if (not isinstance(view,dict)
+                                or view.get("buffer")!=0
+                                or type(view.get("byteLength")) is not int
+                                or type(view.get("byteOffset",0)) is not int
+                                or view["byteLength"]<1
+                                or view.get("byteOffset",0)<0
+                                or view.get("byteOffset",0)+view["byteLength"]>
+                                   buffer["byteLength"]):
+                            raise MediaCustodyError(
+                                "Original GLB geometry buffer view escapes physical bytes")
+                elif has_binary:
+                    raise MediaCustodyError(
+                        "Unreferenced or fake binary 3D payload in original GLB")
+                if first_json.get("meshes") and not buffers:
+                    raise MediaCustodyError(
+                        "Original GLB mesh has no complete geometry buffer")
+        except (OSError,struct.error,UnicodeDecodeError,
+                json.JSONDecodeError,TypeError,AttributeError) as exc:
+            raise MediaCustodyError("Original GLB failed full binary scene verification") from exc
+    elif mime=="image/x-exr":
+        # Standalone, potentially owner-supplied scene-linear EXR must be
+        # physically decoded. A matching EXR magic prefix, filename or
+        # rights string is never evidence of usable pixels.
+        import importlib.util
+        if importlib.util.find_spec("OpenEXR") is None:
+            raise MediaCustodyError("Original OpenEXR decoder is not installed")
+        import OpenEXR
+        try:
+            with path.open("rb") as data:
+                if data.read(4)!=bytes((0x76,0x2f,0x31,0x01)):
+                    raise MediaCustodyError("Original image has no real OpenEXR magic")
+            with OpenEXR.File(str(path),separate_channels=True) as exr:
+                if not exr.parts:
+                    raise MediaCustodyError("Original EXR has no decoded native image part")
+                usable=False
+                for part in exr.parts:
+                    width,height=part.width(),part.height()
+                    if (not isinstance(width,int) or not isinstance(height,int)
+                            or not 1<=width<=32768 or not 1<=height<=32768
+                            or width*height>120000000):
+                        raise MediaCustodyError("Original EXR image dimensions are not bounded")
+                    if not part.channels:
+                        raise MediaCustodyError("Original EXR image has no physical channels")
+                    for channel in part.channels.values():
+                        pixels=channel.pixels
+                        if (pixels is None or pixels.shape[0]!=height
+                                or pixels.shape[1]!=width or
+                                str(pixels.dtype) not in ("float16","float32","uint32")):
+                            raise MediaCustodyError(
+                                "Original EXR channel has no decoded pixel plane")
+                        usable=True
+                if not usable:
+                    raise MediaCustodyError("Original EXR contains no actual pixels")
+        except (OSError,RuntimeError,ValueError,TypeError,IndexError) as exc:
+            raise MediaCustodyError(
+                "No fully decoded native OpenEXR original image") from exc
+    elif mime=="application/x-zx7-exr-bundle":
+        # Never grant trusted CG source rights to an arbitrary ZIP or opaque
+        # binary. Real native OpenEXR re-decodes ALL physically rendered
+        # float32 RGBA, depth, normal and motion passes on ingest.
+        from .body_exr_passes import verify_exr_bundle
+        import zipfile
+        try:
+            actual=verify_exr_bundle(path)
+            if not (actual["original_exr_passes_real"] and
+                    actual["reloaded_every_frame_and_sha256_verified"]):
+                raise MediaCustodyError("Unverified original 32f EXR frame archive")
+        except (ValueError,RuntimeError,TypeError,OSError,KeyError,
+                zipfile.BadZipFile) as exc:
+            raise MediaCustodyError(
+                "Not a physically decoded and verified native 32f EXR bundle") from exc
     elif mime in ("audio/mpeg","audio/flac"):
         import subprocess
         try:
@@ -98,11 +279,21 @@ def verify_media_container(path,mime):
             raise MediaCustodyError("Claimed audio does not contain a decodable stream") from exc
         if not any(x.get("codec_type")=="audio" for x in data.get("streams",[])):
             raise MediaCustodyError("No original decoded source sound")
+        decoded=subprocess.run([
+            "ffmpeg","-hide_banner","-loglevel","error","-nostdin",
+            "-xerror","-i",str(path),"-map","0:a:0",
+            "-f","null","-"],capture_output=True,timeout=3600,check=False)
+        if decoded.returncode!=0:
+            raise MediaCustodyError("Original compressed sound failed full decoder")
     elif mime.startswith("image/"):
         try:
             from PIL import Image
             with Image.open(path) as image:
                 image.verify()
+            with Image.open(path) as image:
+                image.load()
+                if image.width<1 or image.height<1:
+                    raise MediaCustodyError("Original graphic contains no actual pixels")
         except (ImportError,OSError,ValueError) as exc:
             raise MediaCustodyError("No decoded original graphic available") from exc
     # font/ttf, font/otf and binary originals require trusted import provenance
@@ -121,6 +312,8 @@ class MediaVault:
         self.root=Path(root).resolve()
         self.objects=self.root/"objects"
         self.db=self.root/"assets.sqlite3"
+        if self.objects.is_symlink() or self.db.is_symlink():
+            raise MediaCustodyError("Source vault cannot use an external linked object or database")
         self.objects.mkdir(parents=True,exist_ok=True)
         with self._connect() as db:
             db.execute("""CREATE TABLE IF NOT EXISTS blobs(
@@ -136,6 +329,8 @@ class MediaVault:
             db.execute("CREATE INDEX IF NOT EXISTS attested_digest ON attestations(digest)")
 
     def _connect(self):
+        if self.db.is_symlink():
+            raise MediaCustodyError("Original source custody DB was replaced by a link")
         db=connect_durable_database(self.db)
         db.execute("PRAGMA foreign_keys=ON")
         return db
@@ -143,7 +338,10 @@ class MediaVault:
     def _loc(self,digest):
         if not isinstance(digest,str) or not _DIGEST.fullmatch(digest):
             raise MediaCustodyError("Unsafe media content digest")
-        return self.objects/digest[:2]/digest
+        parent=self.objects/digest[:2]
+        if self.objects.is_symlink() or parent.is_symlink():
+            raise MediaCustodyError("Media address escapes original content vault by symlink")
+        return parent/digest
 
     def ingest(self,source,*,mime,rights,source_type,source_id,evidence,
                owner_or_generator):
@@ -168,6 +366,8 @@ class MediaVault:
         digest=sha256_file(path)
         dest=self._loc(digest)
         dest.parent.mkdir(parents=True,exist_ok=True)
+        if dest.is_symlink():
+            raise MediaCustodyError("Content-addressed creative media may not be a symlink")
         if not dest.is_file():
             fd,tmp=tempfile.mkstemp(prefix="."+digest[:10]+"-",dir=dest.parent)
             try:
@@ -175,7 +375,14 @@ class MediaVault:
                     shutil.copyfileobj(stream,handle,1024*1024)
                     handle.flush();os.fsync(handle.fileno())
                 if sha256_file(tmp)!=digest:raise MediaCustodyError("Source changed while ingesting")
-                os.replace(tmp,dest)
+                try:
+                    os.link(tmp,dest)
+                except FileExistsError:
+                    # Two independent producers can race to publish IDENTICAL
+                    # CAS bytes; an unrelated winner is not trusted.
+                    if dest.is_symlink() or not dest.is_file() or sha256_file(dest)!=digest:
+                        raise MediaCustodyError(
+                            "Another publisher placed different bytes in immutable MediaVault")
             finally:
                 if os.path.exists(tmp):os.unlink(tmp)
         elif sha256_file(dest)!=digest:
@@ -213,7 +420,7 @@ class MediaVault:
             else:
                 rows=db.execute("SELECT attestation_id,rights,source_type,source_id,evidence,owner_or_generator FROM attestations WHERE digest=? AND attestation_id=?",
                                (digest,attestation_id)).fetchall()
-        if not rows or not path.is_file() or path.stat().st_size!=blob[0] or sha256_file(path)!=digest:
+        if not rows or path.is_symlink() or not path.is_file() or path.stat().st_size!=blob[0] or sha256_file(path)!=digest:
             raise MediaCustodyError("Missing or altered stored media and provenance")
         return {"asset_id":digest,"size_bytes":blob[0],"mime":blob[1],
                 "path":str(path),"rights_attestations":[{
@@ -227,8 +434,18 @@ class MediaVault:
         dest=Path(destination)
         if dest.exists():raise MediaCustodyError("Never overwrite earlier creative work")
         dest.parent.mkdir(parents=True,exist_ok=True)
-        shutil.copyfile(record["path"],dest)
-        if sha256_file(dest)!=digest:
-            dest.unlink(missing_ok=True)
-            raise MediaCustodyError("Copied creative media differs from immutable source")
+        fd,stage=tempfile.mkstemp(prefix=".zx7-vault-checkout-",
+                                  dir=dest.parent)
+        try:
+            with os.fdopen(fd,"wb") as out,Path(record["path"]).open("rb") as src:
+                shutil.copyfileobj(src,out,1024*1024)
+                out.flush()
+                os.fsync(out.fileno())
+            if sha256_file(stage)!=digest:
+                raise MediaCustodyError(
+                    "Copied creative media differs from immutable source")
+            self.inspect(digest,attestation_id=attestation_id)
+            os.link(stage,dest)
+        finally:
+            Path(stage).unlink(missing_ok=True)
         return record

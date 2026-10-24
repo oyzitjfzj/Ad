@@ -141,5 +141,24 @@
         "sha256": "e9c4294effe162719355d00aa1a969a6f6b3d2ccf73fafb0e280ad6c2e036cb5"
       }
     ]
+  },
+  "canonical_2026_10_23_body_status": {
+    "source_of_truth": "docs/ZX7_BODY_CHECKPOINT_2026-10-23.json",
+    "canonical_branch": "zx7-body/mobile-operator-20261021",
+    "most_recent_accepted_native_code_sha": "aa02050c6e41dcba017aaa45bf86d4cfee4279c0",
+    "last_verified_real_native_run": "https://github.com/oyzitjfzj/Ad/actions/runs/40017123856",
+    "native_test_cases_run": 565,
+    "native_passed": 564,
+    "native_skipped_browser_only": 1,
+    "audited_all_git_tracked_source": "https://github.com/oyzitjfzj/Ad/actions/runs/40017121813",
+    "true_model_generated_end_to_end_premium_film_proven": false,
+    "local_gpu_human_video_inference_proven": false,
+    "original_owner_material_retained": true,
+    "production_release_approved": false,
+    "professional_release_gates_complete": 0,
+    "professional_release_gates_total": 12,
+    "last_decoded_real_renderer_work": "original Blender scene -> EXR32 passes -> ACES2 ProRes10 and layered matte + stereo sound film; native CPU motion-compensated slow-motion",
+    "no_confusion_with_11_second_demo": "Earlier 11-second film used script-authored creative directions, NOT independently run AI creative Brain",
+    "notes": "A CI-passing collection of actual machine capabilities is not certification of world-leading independent creative cinema."
   }
 }

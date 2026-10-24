@@ -26,13 +26,22 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit,unquote
+from urllib.parse import urlsplit,unquote,parse_qs
 
 from .body_capabilities import operational_tool_summary,explain_operational_tool
+from .body_affordances import BodyAffordanceSurface
+from .body_sensory import sense_body_job
+from .body_integration import body_catalog
 from .body_integration import run_body_project
 from .media_vault import MediaVault,sha256_file,verify_media_container
 from .body_archive import create_body_archive
 from .durable_sqlite import connect_durable_database
+from .body_mobile import ASSETS as MOBILE_ASSETS, CSP as MOBILE_CSP
+from .body_download_tickets import DownloadTickets
+from .body_verified_delivery import verified_artifact_snapshot
+from .body_host_resources import inspect_host_resources
+from .body_revision_impact import plan_film_revision_impact
+from .durable_graph import durable_project_key
 
 _ID=re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 _MAX_JOB_BODY=4*1024*1024
@@ -49,12 +58,19 @@ class LocalBodyCoordinator:
     def __init__(self,root,*,execute=None,workers=1):
         if type(workers) is not int or not (1<=workers<=16):
             raise ValueError("Operator must choose finite host workload capacity")
+        if Path(root).is_symlink():
+            raise ValueError("Studio host root cannot be a filesystem link")
         self.root=Path(root).resolve()
         self.root.mkdir(parents=True,exist_ok=True)
+        for name in ("body-service.lock","body-jobs.sqlite3","projects"):
+            if (self.root/name).is_symlink():
+                raise ValueError("Studio host state cannot be a filesystem link")
         # An OS process lock is released on crash, unlike a stale Python flag.
         # Two independent services must NEVER drive the same renderer DB,
         # originals and partially produced frames concurrently.
-        self._instance_lock=(self.root/"body-service.lock").open("a+")
+        lock_fd=os.open(self.root/"body-service.lock",
+                        os.O_RDWR|os.O_CREAT|getattr(os,"O_NOFOLLOW",0),0o600)
+        self._instance_lock=os.fdopen(lock_fd,"a+")
         try:
             fcntl.flock(self._instance_lock.fileno(),
                         fcntl.LOCK_EX|fcntl.LOCK_NB)
@@ -62,6 +78,8 @@ class LocalBodyCoordinator:
             self._instance_lock.close()
             raise RuntimeError("Original production workspace is already owned by another running body service") from exc
         self.projects=self.root/"projects"
+        if self.projects.is_symlink():
+            raise ValueError("Studio projects root cannot be linked to another owner")
         self.projects.mkdir(exist_ok=True)
         self.database=self.root/"body-jobs.sqlite3"
         self.executor=concurrent.futures.ThreadPoolExecutor(
@@ -89,6 +107,8 @@ class LocalBodyCoordinator:
         self._reconcile_orphaned_work_on_exclusive_startup()
 
     def _connect(self):
+        if self.database.is_symlink():
+            raise ValueError("Original host production database was replaced by a link")
         return connect_durable_database(self.database)
 
     def _reconcile_orphaned_work_on_exclusive_startup(self):
@@ -121,8 +141,11 @@ class LocalBodyCoordinator:
     def _workspace(self,identity):
         if not isinstance(identity,str) or not _ID.fullmatch(identity):
             raise ValueError("Unsafe original project/workspace identity")
-        place=(self.projects/identity).resolve()
-        if not place.is_relative_to(self.projects):
+        requested=self.projects/identity
+        if requested.is_symlink():
+            raise ValueError("One owner workspace cannot alias another")
+        place=requested.resolve()
+        if not place.is_relative_to(self.projects) or place.name!=identity:
             raise ValueError("Original project cannot escape studio folder")
         return place
 
@@ -149,7 +172,6 @@ class LocalBodyCoordinator:
             if final.exists():
                 raise FileExistsError("Original imported media is immutable; never overwrite")
             stage=folder/(".zx7-import-"+uuid.uuid4().hex+".tmp")
-            published=False
             try:
                 with stage.open("xb") as dest:
                     remaining=bytes_expected
@@ -166,16 +188,15 @@ class LocalBodyCoordinator:
                     source_type="owner_upload",source_id=source_id,
                     evidence=rights_evidence,owner_or_generator="authenticated_local_owner")
                 os.link(stage,final)
-                published=True
                 return {"source":filename,"asset_id":attested["asset_id"],
                         "attestation_id":attested["attestation_id"],
                         "mime":mime,"bytes":bytes_expected,
                         "verified_real_media_bytes":True,
                         "rights_claim":"Owner-attested; no independent legal ownership certification"}
-            except BaseException:
-                if published:final.unlink(missing_ok=True)
-                raise
             finally:
+                # Original uploads are immutable once exclusively linked.
+                # Never unlink an independently accepted media file after
+                # another service/editor wins a publication race.
                 stage.unlink(missing_ok=True)
 
     def submit(self,film_ir,*,workspace_id,job_id=None):
@@ -326,25 +347,46 @@ class LocalBodyCoordinator:
                           "physically_encoded_quality_certified":False})
         return {"job_id":identity,"assets":items}
 
-    def _stage_progress(self,workspace_id):
-        """Real persisted tool states, never invented percent complete."""
+    def _stage_progress(self,workspace_id,*,project_key=None,node_ids=()):
+        """Read only this actual creative project lineage's persisted stages.
+
+        Stage caches are shared across revisions of the SAME creative project:
+        they are NOT individual job attempts or approved movie evidence.
+        """
+        empty={"observed_tool_states":[],
+               "tool_progress_is_actual_sqlite":False,
+               "stage_scope":"no_verified_project_lineage"}
+        if not isinstance(project_key,str) or not re.fullmatch(r"[a-f0-9]{64}",project_key):
+            return empty
+        if not isinstance(node_ids,(set,list,tuple,frozenset)) or not all(
+                isinstance(n,str) for n in node_ids):
+            return empty
+        approved=set(node_ids)
+        if not approved:
+            return {**empty,"stage_scope":"film_lineage_with_no_stage_nodes"}
         location=self._workspace(workspace_id)
         path=location/"production.sqlite3"
         if not path.is_file():
-            return {"observed_tool_states":[],"tool_progress_is_actual_sqlite":False}
+            return empty
         try:
-            from .durable_graph import DurableFilmGraph
             with sqlite3.connect(f"file:{path}?mode=ro",uri=True,timeout=4) as db:
                 tables=db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
                 if ("node_results",) not in tables:
-                    return {"observed_tool_states":[],"tool_progress_is_actual_sqlite":False}
+                    return empty
                 rows=db.execute("""SELECT node_id,node_state,attempts,updated_at
-                    FROM node_results ORDER BY updated_at DESC LIMIT 500""").fetchall()
-            return {"observed_tool_states":[{"node_id":a,"state":b,"attempts":c,
-                "updated_at":d} for a,b,c,d in rows],
-                "tool_progress_is_actual_sqlite":True}
+                    FROM node_results WHERE project_key=?
+                    ORDER BY updated_at DESC LIMIT 500""",(project_key,)).fetchall()
+            return {"observed_tool_states":[
+                {"node_id":a,"state":b,"attempts":c,"updated_at":d}
+                for a,b,c,d in rows if a in approved],
+                "tool_progress_is_actual_sqlite":True,
+                "stage_scope":"verified_shared_project_lineage_not_single_job_attempt"}
         except (sqlite3.Error,ValueError,OSError):
-            return {"observed_tool_states":[],"tool_progress_is_actual_sqlite":False}
+            return empty
+
+    def host_resource_status(self):
+        """Only live technical capacity, never unverified AI model execution."""
+        return inspect_host_resources(self.root)
 
     def list_jobs(self,*,limit=100):
         """Bounded honest job statuses for a standalone creative desktop client."""
@@ -427,14 +469,33 @@ class LocalBodyCoordinator:
         if not isinstance(identity,str) or not _ID.fullmatch(identity):
             raise ValueError("Invalid original job identity")
         with self._connect() as db:
-            row=db.execute("""SELECT workspace_id,status,attempts,result,modified
-                FROM jobs WHERE id=?""",(identity,)).fetchone()
+            row=db.execute("""SELECT workspace_id,status,attempts,result,modified,
+                       original_ir FROM jobs WHERE id=?""",(identity,)).fetchone()
         if row is None:raise ValueError("Unknown job")
+        result=json.loads(row[3]) if row[3] else None
+        original=json.loads(row[5])
+        nodes=original.get("tool_graph",[]) if isinstance(original,dict) else []
+        node_ids={n["id"] for n in nodes if isinstance(n,dict)
+                  and isinstance(n.get("id"),str)}
+        # Persisted finished reports must match THIS job's original project.
+        # A queued job can never claim previous or another worker's progress.
+        project_key=None
+        if row[1]!="queued" and isinstance(original,dict):
+            try:
+                expected=durable_project_key(original,
+                    fact_ids=set(original.get("owner_facts",{})),
+                    allowed_access=frozenset({"read","write"}))
+            except (TypeError,ValueError):
+                expected=None
+            if expected is not None and (row[1]=="running" or (
+                    isinstance(result,dict) and result.get("project_key")==expected)):
+                project_key=expected
         return {"job_id":identity,"workspace_id":row[0],"status":row[1],
-                "attempts":row[2],"result":json.loads(row[3]) if row[3] else None,
+                "attempts":row[2],"result":result,
                 "updated_at":row[4],
                 "requested_action":self._requested_control(identity),
-                "actual_tool_progress":self._stage_progress(row[0])}
+                "actual_tool_progress":self._stage_progress(row[0],
+                     project_key=project_key,node_ids=node_ids)}
 
     def pending_restart(self):
         with self._connect() as db:
@@ -451,6 +512,7 @@ class LocalBodyCoordinator:
 
 
 def make_body_http_handler(coordinator,token):
+    delivery_tickets=DownloadTickets()
     if not isinstance(token,str) or len(token)<32:
         raise ValueError("Local creative body API needs secret >=32 characters")
     def _utf8_media_header(headers,raw_name,encoded_name):
@@ -482,27 +544,86 @@ def make_body_http_handler(coordinator,token):
                 self._reply(401,{"error":"Local production service requires host authorization"})
                 return False
             return True
-        def _stream_artifact(self,identity,relative):
+        def _stream_artifact(self,identity,relative,expected=None):
             media=coordinator.inspect_media(identity,relative)
-            self.send_response(200)
-            self.send_header("Content-Type",media["mime"])
-            self.send_header("Content-Length",str(media["bytes"]))
-            self.send_header("X-ZX7-SHA256",media["sha256"])
-            self.send_header("Content-Disposition",
-                             'attachment; filename="'+media["path"].name+'"')
-            self.send_header("Cache-Control","no-store")
-            self.end_headers()
-            with media["path"].open("rb") as source:
-                shutil.copyfileobj(source,self.wfile,1024*1024)
+            if expected is not None and (
+                media["sha256"]!=expected["sha256"] or
+                media["bytes"]!=expected["bytes"]):
+                return self._reply(409,{"error":"Original media changed after ticket authorization"})
+            # Snapshot the exact ORIGINAL bytes first. The old implementation
+            # checked one open of the pathname then reopened it after HTTP
+            # headers: a replaced file could be delivered under a false hash.
+            try:
+                with verified_artifact_snapshot(media) as source:
+                    self.send_response(200)
+                    self.send_header("Content-Type",media["mime"])
+                    self.send_header("Content-Length",str(media["bytes"]))
+                    self.send_header("X-ZX7-SHA256",media["sha256"])
+                    self.send_header("Referrer-Policy","no-referrer")
+                    self.send_header("Content-Disposition",
+                                     'attachment; filename="'+Path(media["path"]).name+'"')
+                    self.send_header("Cache-Control","no-store")
+                    self.send_header("X-Content-Type-Options","nosniff")
+                    self.end_headers()
+                    shutil.copyfileobj(source,self.wfile,1024*1024)
+            except (ValueError,RuntimeError) as exc:
+                # A capacity failure (503) or a stale media SHA (409) cannot
+                # masquerade as a successful original film transfer.
+                code=503 if isinstance(exc,RuntimeError) else 409
+                return self._reply(code,{"error":str(exc)})
         def do_GET(self):
-            if not self._authorized():return
             path=urlsplit(self.path).path
+            if path in MOBILE_ASSETS:
+                # Static shell contains NO user data or secret. Browser API calls
+                # still need the existing Bearer token and remain loopback-bound.
+                media,contents=MOBILE_ASSETS[path]
+                self.send_response(200)
+                self.send_header("Content-Type",media)
+                self.send_header("Content-Length",str(len(contents)))
+                self.send_header("Cache-Control","no-store")
+                self.send_header("Content-Security-Policy",MOBILE_CSP)
+                self.send_header("X-Content-Type-Options","nosniff")
+                self.send_header("Referrer-Policy","no-referrer")
+                self.end_headers()
+                self.wfile.write(contents)
+                return
+            if path.startswith("/v1/download/"):
+                ticket=delivery_tickets.consume(path.removeprefix("/v1/download/"))
+                if ticket is None:
+                    return self._reply(404,{"error":"Download authorization expired or already used"})
+                try:
+                    return self._stream_artifact(ticket["job_id"],ticket["relative"],expected=ticket)
+                except (OSError,ValueError,TypeError):
+                    return self._reply(404,{"error":"Authorized original media no longer available"})
+            if not self._authorized():return
             try:
                 if path=="/v1/health":
                     return self._reply(200,{"service":"zx7-local-body",
                         "host_only":"127.0.0.1","online":True})
                 if path=="/v1/jobs":
                     return self._reply(200,coordinator.list_jobs())
+                if path=="/v1/resources":
+                    return self._reply(200,coordinator.host_resource_status())
+                if path=="/v1/affordances":
+                    opts=parse_qs(urlsplit(self.path).query,keep_blank_values=True)
+                    if any(k not in ("capability","limit","cursor","include_unavailable") or
+                           len(v)!=1 for k,v in opts.items()):
+                        raise ValueError("Invalid bounded somatic capability query")
+                    limit=int(opts.get("limit",["12"])[0])
+                    flag=opts.get("include_unavailable",["false"])[0]
+                    if flag not in ("true","false"):
+                        raise ValueError("Invalid unavailable-tool query option")
+                    catalog=body_catalog(coordinator.projects)
+                    return self._reply(200,BodyAffordanceSurface(catalog).discover(
+                        capability=opts.get("capability",[None])[0],limit=limit,
+                        include_unavailable=flag=="true",
+                        cursor=opts.get("cursor",[None])[0],
+                        allowed_access=frozenset({"read","write"})))
+                if path.startswith("/v1/affordances/"):
+                    name=path.removeprefix("/v1/affordances/")
+                    return self._reply(200,BodyAffordanceSurface(
+                        body_catalog(coordinator.projects)).describe(name,
+                            allowed_access=frozenset({"read","write"})))
                 if path=="/v1/tools":
                     return self._reply(200,{"tools":operational_tool_summary(
                         coordinator.projects)})
@@ -512,6 +633,9 @@ def make_body_http_handler(coordinator,token):
                         coordinator.projects,name))
                 if path.startswith("/v1/jobs/"):
                     rest=path.removeprefix("/v1/jobs/")
+                    if rest.endswith("/sense"):
+                        identity=rest.removesuffix("/sense")
+                        return self._reply(200,sense_body_job(coordinator,identity))
                     if "/artifacts/" in rest:
                         identity,relative=rest.split("/artifacts/",1)
                         self._stream_artifact(identity,unquote(relative))
@@ -526,6 +650,57 @@ def make_body_http_handler(coordinator,token):
         def do_POST(self):
             if not self._authorized():return
             path=urlsplit(self.path).path
+            if path=="/v1/affordances/preflight":
+                # A sensory validation, NEVER a privileged execution or grant.
+                # The owner must submit an independently protected Film IR job.
+                try:
+                    length=int(self.headers.get("Content-Length","0"))
+                    if not 0<length<=_MAX_JOB_BODY:
+                        raise ValueError("Bounded sensory preflight input required")
+                    payload=json.loads(self.rfile.read(length))
+                    if not isinstance(payload,dict) or set(payload)!={
+                            "workspace_id","tool_id","inputs"}:
+                        raise ValueError("Preflight takes exact existing workspace, tool and data")
+                    workspace=coordinator._workspace(payload["workspace_id"])
+                    if not workspace.is_dir():
+                        raise ValueError("Original owner workspace not present")
+                    return self._reply(200,BodyAffordanceSurface(
+                        body_catalog(workspace)).preflight(
+                            payload["tool_id"],payload["inputs"],
+                            allowed_access=frozenset({"read","write"})))
+                except (ValueError,TypeError,RuntimeError,PermissionError) as exc:
+                    return self._reply(400,{"error":str(exc)})
+            if path=="/v1/revisions/impact":
+                # Read-only architectural diff. It does not execute a model,
+                # reserve compute, alter the original Film IR or certify any
+                # physical media as cached. Authentication is mandatory.
+                try:
+                    length=int(self.headers.get("Content-Length","0"))
+                    if not (0<length<=_MAX_JOB_BODY):
+                        raise ValueError("Bounded original film revision pair required")
+                    payload=json.loads(self.rfile.read(length))
+                    if not isinstance(payload,dict) or set(payload)!={"before","after"}:
+                        raise ValueError("Exactly two original film IR revisions required")
+                    return self._reply(200,plan_film_revision_impact(
+                        payload["before"],payload["after"]))
+                except (ValueError,TypeError,RecursionError) as exc:
+                    return self._reply(400,{"error":str(exc)})
+
+            if path.startswith("/v1/jobs/") and path.endswith("/download-ticket"):
+                rest=path.removeprefix("/v1/jobs/").removesuffix("/download-ticket")
+                if "/artifacts/" not in rest:
+                    return self._reply(404,{"error":"Missing exact original artifact identity"})
+                identity,relative=rest.split("/artifacts/",1)
+                try:
+                    if self.headers.get("Content-Length","0") not in ("0",""):
+                        raise ValueError("Media download ticket accepts no model input")
+                    decoded=unquote(relative)
+                    media=coordinator.inspect_media(identity,decoded)
+                    ticket=delivery_tickets.issue(identity,decoded,
+                        sha256=media["sha256"],length=media["bytes"])
+                    return self._reply(201,ticket)
+                except (ValueError,TypeError,OSError,RuntimeError) as exc:
+                    return self._reply(400,{"error":str(exc)})
             if path.startswith("/v1/workspaces/") and "/assets/" in path:
                 pieces=path.split("/")
                 if len(pieces)!=6 or pieces[1:3]!=["v1","workspaces"] or (

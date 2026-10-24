@@ -100,6 +100,30 @@ class TrustedCreativeBodyToolTests(unittest.TestCase):
                         _commit_actual_body_output(target,successful)
             self.assertEqual(target.read_bytes(),b"physically rendered bytes"*50)
 
+    @unittest.skipUnless(importlib.util.find_spec("PIL") or shutil.which("ffmpeg"),
+                         "Requires a genuine decoded image backend")
+    def test_late_directory_sync_error_preserves_already_published_original(self):
+        # A backend or another editor might have accepted the final file
+        # before the filesystem reported a late directory fsync failure.
+        # Failure must not delete the public master or leave private stages.
+        with tempfile.TemporaryDirectory() as root:
+            target=Path(root)/"already-accepted.png"
+            from studio_next.body_integration import _commit_actual_body_output
+            def produce(stage):
+                stage.write_bytes(actual_rgb_png())
+            with patch("studio_next.body_integration.sync_published_file",
+                       side_effect=OSError("simulated postlink durability failure")):
+                with self.assertRaisesRegex(OSError,"postlink durability"):
+                    _commit_actual_body_output(target,produce)
+            self.assertTrue(target.is_file())
+            from studio_next.media_vault import verify_media_container
+            verify_media_container(target,"image/png")
+            self.assertFalse(list(Path(root).glob(".zx7-uncommitted-*")))
+            before=target.read_bytes()
+            with self.assertRaises(FileExistsError):
+                _commit_actual_body_output(target,produce)
+            self.assertEqual(target.read_bytes(),before)
+
     def test_png_header_without_actual_pixels_is_never_a_real_artifact(self):
         with tempfile.TemporaryDirectory() as root:
             p=Path(root)/"fake-thumbnail.png"
@@ -124,13 +148,52 @@ class TrustedCreativeBodyToolTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,"trusted renderer dependency"):
             _require_authentic_generated_media_lineage(
                 {"tool_graph":[read,fabricated]})
-        trusted={"id":"edit","tool_id":"body.render_edit","inputs":{},
-                 "depends_on":[]}
+        legacy={"id":"edit","tool_id":"body.render_edit","inputs":{},
+                "depends_on":[]}
         valid={"id":"vault","tool_id":"body.asset_vault",
                "depends_on":["edit"],
                "inputs":{"source_witness":{"$node_output":"edit"}}}
+        with self.assertRaisesRegex(ValueError,"trusted renderer dependency"):
+            _require_authentic_generated_media_lineage(
+                {"tool_graph":[legacy,valid]})
+        for untrusted in ("body.vector_png","body.film_thumbnail"):
+            with self.subTest(tool=untrusted),self.assertRaisesRegex(
+                    ValueError,"trusted renderer dependency"):
+                _require_authentic_generated_media_lineage(
+                    {"tool_graph":[{**legacy,"tool_id":untrusted},valid]})
+        trusted={**legacy,"tool_id":"body.render_edit_owned"}
         self.assertIsNone(_require_authentic_generated_media_lineage(
             {"tool_graph":[trusted,valid]}))
+        for real_cg in ("body.exr_passes","body.exr_checkpoint"):
+            with self.subTest(real_cg=real_cg):
+                original={**legacy,"tool_id":real_cg}
+                self.assertIsNone(_require_authentic_generated_media_lineage(
+                    {"tool_graph":[original,valid]}))
+        for unapproved in ("body.aces2_preview","body.inspect",
+                           "body.otio","body.render_edit"):
+            with self.subTest(unapproved=unapproved):
+                original={**legacy,"tool_id":unapproved}
+                with self.assertRaisesRegex(ValueError,"trusted renderer dependency"):
+                    _require_authentic_generated_media_lineage(
+                        {"tool_graph":[original,valid]})
+
+    def test_actual_png_witness_cannot_mint_generated_rights_by_direct_catalog_call(self):
+        if importlib.util.find_spec("PIL") is None and not shutil.which("ffmpeg"):
+            self.skipTest("Actual PNG decoder required to prove a genuine source witness")
+        with tempfile.TemporaryDirectory() as root:
+            path=Path(root)/"real-original-graphic.png"
+            path.write_bytes(actual_rgb_png())
+            catalog=body_catalog(root)
+            import hashlib
+            actual={"path":str(path),"sha256":hashlib.sha256(path.read_bytes()).hexdigest(),
+                    "bytes":path.stat().st_size}
+            self.assertTrue(validate_witness("body.vector_png",actual))
+            with self.assertRaisesRegex(PermissionError,"verified durable producer DAG"):
+                catalog.invoke("body.asset_vault",{"source_witness":actual},
+                               allowed_access={"write"})
+            from studio_next.media_vault import MediaVault,MediaCustodyError
+            with self.assertRaises(MediaCustodyError):
+                MediaVault(Path(root)/"vault").inspect(actual["sha256"])
 
     def test_no_model_supplied_shell_or_untrusted_media_rights(self):
         with tempfile.TemporaryDirectory() as root:

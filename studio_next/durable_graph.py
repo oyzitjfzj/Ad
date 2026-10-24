@@ -27,6 +27,7 @@ from .registry import ToolCatalog
 from .stage_checkpoint import fingerprint
 from .body_publication import physical_tool_attempt
 from .durable_sqlite import connect_durable_database
+from .body_dependency_scope import select_verified_node_assets
 
 
 class RecoveryBlocked(RuntimeError):
@@ -120,6 +121,25 @@ class DurableFilmGraph:
             return "execute",None,owner
         return self._transaction(operation)
 
+    def renew_running_lease(self,project_key,node_id,input_sha,owner,lease_seconds):
+        """Extend a lease ONLY for its exact live owner; never steal another stage.
+
+        The trusted BODY worker supplies this heartbeat, not the artistic
+        model. Returns false after completion, failure or ownership loss.
+        """
+        import math
+        if not isinstance(lease_seconds,(int,float)) or isinstance(lease_seconds,bool) or (
+                not math.isfinite(lease_seconds) or lease_seconds<=0):
+            raise ValueError("Finite positive original renderer lease needed")
+        now=self.clock()
+        def operation(db):
+            cursor=db.execute("""UPDATE node_results SET lease_until=?,updated_at=?
+                WHERE project_key=? AND node_id=? AND input_fingerprint=?
+                  AND owner=? AND node_state='running'""",
+                (now+lease_seconds,now,project_key,node_id,input_sha,owner))
+            return cursor.rowcount==1
+        return self._transaction(operation)
+
     def complete(self,project_key,node_id,input_sha,owner,result):
         serial=_wire(result)
         digest=fingerprint(result)
@@ -153,6 +173,24 @@ class DurableFilmGraph:
                 for a,b,c,d in rows]
 
 
+def durable_project_key(ir, *, fact_ids, allowed_access):
+    """Derive the exact graph namespace from host-approved facts and access.
+
+    Same film revisions may share a cache; unrelated films must never appear
+    as a single job's execution progress merely because they share a folder.
+    No media is executed or approved by calculating this identifier.
+    """
+    if not isinstance(ir,dict) or not isinstance(ir.get("project"),dict):
+        raise ValueError("A real immutable creative project is required")
+    rights=set(fact_ids)
+    permitted=frozenset(allowed_access)
+    if not permitted.issubset({"read","write","network","paid"}):
+        raise ValueError("Invalid production access scope")
+    return fingerprint({"creative_project":ir["project"],
+        "fact_ids":sorted(rights),"owner_facts":ir.get("owner_facts",{}),
+        "permission":sorted(permitted),"durable_schema":2})
+
+
 def execute_durable_film_graph(ir,catalog,*,fact_ids,store,
                                 trusted_idempotent_tools=frozenset(),
                                 output_verifier=None,tool_revisions=None,
@@ -173,9 +211,11 @@ def execute_durable_film_graph(ir,catalog,*,fact_ids,store,
         raise ValueError("Source media fingerprint must come from trusted body code")
     if boundary_control is not None and not callable(boundary_control):
         raise ValueError("Only trusted operator control may stop production")
-    if not isinstance(lease_seconds,(int,float)) or lease_seconds<=0:
-        raise ValueError("Positive safe worker lease required")
-    if not isinstance(step_budget,int) or step_budget<1:
+    import math
+    if not isinstance(lease_seconds,(int,float)) or isinstance(lease_seconds,bool) or (
+            not math.isfinite(lease_seconds) or lease_seconds<=0):
+        raise ValueError("Finite positive safe worker lease required")
+    if type(step_budget) is not int or step_budget<1:
         raise ValueError("Finite approved compute budget required")
     tool_revisions=tool_revisions or {}
     if not isinstance(tool_revisions,dict):
@@ -199,9 +239,7 @@ def execute_durable_film_graph(ir,catalog,*,fact_ids,store,
     # Stable project identity permits *unchanged* shots to be resumed after
     # the artist revises an unrelated shot. Every node still authenticates
     # its own art, inputs, media assets, installed tool and upstream lineage.
-    project_key=fingerprint({"creative_project":ir["project"],
-        "fact_ids":sorted(rights),"owner_facts":ir.get("owner_facts",{}),
-        "permission":sorted(permission),"durable_schema":2})
+    project_key=durable_project_key(ir,fact_ids=rights,allowed_access=permission)
     outputs={}
     complete=[];reused=[];errors=[];trace=[]
     for node_id in validation.order:
@@ -229,11 +267,13 @@ def execute_durable_film_graph(ir,catalog,*,fact_ids,store,
         relevant_shots=[shot for shot in ir["shots"]
                         if not related or shot["id"] in related]
         try:
+            relevant_assets=select_verified_node_assets(
+                ir.get("assets",[]),node,relevant_shots)
             materials=(input_material_fingerprint(tid,inputs)
                        if input_material_fingerprint is not None else None)
             input_key=fingerprint({"tool_id":tid,"version":tool_version,
                 "artistic_tool_node":node,"original_shots":relevant_shots,
-                "verified_assets":ir.get("assets",[]),
+                "verified_assets":relevant_assets,
                 "actual_material_sha":materials,
                 "args":inputs,"dependencies":{
                     dep:fingerprint(outputs[dep]) for dep in node.get("depends_on",[])}})
@@ -249,13 +289,30 @@ def execute_durable_film_graph(ir,catalog,*,fact_ids,store,
                 out=cached
                 reused.append(node_id)
             else:
+                from .body_stage_lease import RunningStageHeartbeat
+                heart=RunningStageHeartbeat(
+                    store,project_key,node_id,input_key,owner,
+                    lease_seconds=lease_seconds)
                 try:
+                    heart.start()
                     with physical_tool_attempt(project_key,node_id,input_key,tid):
                         out=catalog.invoke(tid,inputs,allowed_access=permission)
                     if not output_verifier(tid,out):
                         raise ValueError("Tool provided no physically verified asset")
+                    # The physical original media may have changed while a
+                    # long-running encoder was working. Provenance is binding
+                    # only if SAME BYTES still exist at commit time.
+                    if input_material_fingerprint is not None:
+                        after_materials=input_material_fingerprint(tid,inputs)
+                        if after_materials!=materials:
+                            raise RecoveryBlocked(
+                                "Original source changed during physical render; cannot certify stale input")
+                    # The heartbeat is stopped before committing, so it can
+                    # never race a completed node and claim lease loss.
+                    heart.stop()
                     store.complete(project_key,node_id,input_key,owner,out)
                 except BaseException:
+                    heart.abort()
                     store.failed(project_key,node_id,input_key,owner)
                     raise
             outputs[node_id]=out

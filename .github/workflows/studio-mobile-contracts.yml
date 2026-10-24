@@ -1,0 +1,107 @@
+name: "ZX7 BODY — Mobile Console Security Contract"
+on:
+  workflow_dispatch:
+  push:
+    branches: [zx7-body/mobile-operator-20261021]
+    paths:
+      - "studio_next/**"
+      - "studio_next/body_mobile.py"
+      - "studio_next/precision_retime.py"
+      - "studio_next/body_archive.py"
+      - "studio_next/test_body_archive.py"
+      - "studio_next/body_portability.py"
+      - "studio_next/body_asset_links.py"
+      - "studio_next/body_verified_delivery.py"
+      - "studio_next/body_stage_lease.py"
+      - "studio_next/body_host_resources.py"
+      - "studio_next/test_body_host_resources.py"
+      - "studio_next/test_body_stage_lease.py"
+      - "studio_next/durable_graph.py"
+      - "studio_next/body_dependency_scope.py"
+      - "studio_next/body_revision_impact.py"
+      - "studio_next/body_color_pipeline.py"
+      - "studio_next/body_exr_passes.py"
+      - "studio_next/body_frame_resume.py"
+      - "studio_next/body_observation.py"
+      - "studio_next/body_review_access.py"
+      - "studio_next/body_review_compare.py"
+      - "studio_next/test_body_review_compare.py"
+      - "studio_next/test_body_review_access.py"
+      - "studio_next/test_body_observation.py"
+      - "studio_next/test_body_frame_resume.py"
+      - "studio_next/blender_scene.py"
+      - "studio_next/test_body_exr_passes.py"
+      - "studio_next/blender_scene.py"
+      - "pyproject.toml"
+      - "studio_next/test_body_chroma_vfx.py"
+      - "studio_next/composite_mix.py"
+      - "studio_next/test_body_audio_automation.py"
+      - "studio_next/body_loudness.py"
+      - "studio_next/test_body_loudness.py"
+      - "studio_next/test_body_color_pipeline.py"
+      - "studio_next/body_integration.py"
+      - "studio_next/body_materials.py"
+      - "studio_next/test_body_revision_http.py"
+      - "studio_next/body_revision_impact.py"
+      - "studio_next/test_body_revision_impact.py"
+      - "studio_next/test_body_incremental_cinema.py"
+      - "studio_next/test_body_dependency_scope.py"
+      - "studio_next/film_ir.py"
+      - "studio_next/test_body_verified_delivery.py"
+      - "studio_next/test_body_asset_identity.py"
+      - "studio_next/test_body_asset_uri.py"
+      - "studio_next/composite_mix.py"
+      - "studio_next/body_tool_contracts.py"
+      - "studio_next/test_body_asset_links.py"
+      - "studio_next/test_body_portability.py"
+      - "studio_next/creative_tool_registry.py"
+      - "studio_next/test_creative_tool_registry.py"
+      - "studio_next/test_precision_retime.py"
+      - "studio_next/body_sequence_cuts.py"
+      - "studio_next/test_body_sequence_cuts.py"
+      - "studio_next/body_owned_edit.py"
+      - "studio_next/test_body_owned_edit.py"
+      - "studio_next/test_body_integration.py"
+      - "studio_next/body_native_proof.py"
+      - "studio_next/body_timeline_revision.py"
+      - "studio_next/test_body_timeline_revision.py"
+      - "studio_next/body_affordances.py"
+      - "studio_next/body_signal.py"
+      - "studio_next/test_body_signal.py"
+      - "studio_next/test_body_affordances.py"
+      - "studio_next/body_sensory.py"
+      - "studio_next/test_body_sensory.py"
+      - "studio_next/body_integration.py"
+      - "studio_next/body_materials.py"
+      - "studio_next/body_download_tickets.py"
+      - "studio_next/test_body_download_tickets.py"
+      - "studio_next/body_service.py"
+      - "studio_next/test_body_mobile.py"
+      - ".github/workflows/studio-mobile-contracts.yml"
+# Free runner minutes: superseded same-branch proof runs cannot waste native compute.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  mobile-security:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile server and serve static shell with protected APIs
+        run: |
+          python -m compileall -q studio_next
+          python -m unittest studio_next.test_body_mobile studio_next.test_body_download_tickets studio_next.test_precision_retime studio_next.test_creative_tool_registry studio_next.test_body_archive studio_next.test_body_portability studio_next.test_body_asset_links studio_next.test_body_asset_identity studio_next.test_body_asset_uri studio_next.test_body_verified_delivery studio_next.test_body_stage_lease studio_next.test_body_host_resources studio_next.test_body_dependency_scope studio_next.test_body_revision_impact studio_next.test_body_revision_http studio_next.test_body_incremental_cinema studio_next.test_body_color_pipeline studio_next.test_body_chroma_vfx studio_next.test_body_exr_passes studio_next.test_body_frame_resume studio_next.test_body_observation studio_next.test_body_review_access studio_next.test_body_review_compare studio_next.test_body_audio_automation studio_next.test_body_loudness studio_next.test_body_integration studio_next.test_body_owned_edit studio_next.test_body_sequence_cuts studio_next.test_body_timeline_revision studio_next.test_body_affordances studio_next.test_body_sensory studio_next.test_body_signal -v
+      - name: Parse actual client JavaScript in Node
+        run: |
+          python - <<'PY'
+          from studio_next.body_mobile import SCRIPT
+          from pathlib import Path
+          Path("/tmp/zx7-studio.js").write_text(SCRIPT)
+          PY
+          node --check /tmp/zx7-studio.js

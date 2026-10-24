@@ -30,18 +30,27 @@ class DurableStageStore:
     def __init__(self, root):
         self.root=Path(root)
 
-    def _path(self, name):
+    def _path(self, name, immutable_input=None):
         if not isinstance(name,str) or _STAGE.fullmatch(name) is None:
             raise ValueError("Unsafe checkpoint identity")
-        return self.root/(name+".json")
+        if immutable_input is None:
+            return self.root/(name+".json")
+        return self.root/(name+"."+fingerprint(immutable_input)+".json")
 
     def find(self, name, immutable_input):
-        path=self._path(name)
+        path=self._path(name,immutable_input)
+        if self.root.is_symlink() or path.is_symlink():
+            raise ValueError("Creative stage source checkpoint is a symbolic link")
+        if not path.is_file():
+            path=self._path(name)
+        if self.root.is_symlink() or path.is_symlink():
+            raise ValueError("Legacy creative checkpoint is a symbolic link")
         if not path.is_file():
             return None
         content=json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(content,dict) or content.get("schema")!=1:
-            raise ValueError("Corrupt/unknown checkpoint schema")
+        if (not isinstance(content,dict) or content.get("schema")!=1
+                or content.get("stage")!=name):
+            raise ValueError("Corrupt/unknown original stage checkpoint schema")
         if content.get("input_sha256")!=fingerprint(immutable_input):
             # A different director version must NOT receive a stale shot.
             return None
@@ -51,7 +60,9 @@ class DurableStageStore:
         return output
 
     def save(self, name, immutable_input, model_output):
-        path=self._path(name)
+        path=self._path(name,immutable_input)
+        if self.root.is_symlink() or path.is_symlink():
+            raise ValueError("Model checkpoint output cannot be a symbolic link")
         self.root.mkdir(parents=True,exist_ok=True)
         record={"schema":1,"stage":name,
                 "input_sha256":fingerprint(immutable_input),
@@ -59,13 +70,25 @@ class DurableStageStore:
                 "model_output":model_output}
         # File is always closed and fsynced BEFORE it becomes visible as valid.
         blob=json.dumps(record,ensure_ascii=False,indent=2,allow_nan=False)+"\n"
-        fd,tmp=tempfile.mkstemp(prefix="."+name+"-",suffix=".tmp",dir=self.root)
+        fd,tmp=tempfile.mkstemp(prefix=".zx7-stage-checkpoint-",suffix=".tmp",dir=self.root)
         try:
             with os.fdopen(fd,"w",encoding="utf-8") as dest:
                 dest.write(blob)
                 dest.flush()
                 os.fsync(dest.fileno())
-            os.replace(tmp,path)
+            try:
+                os.link(tmp,path)
+            except FileExistsError:
+                if (path.is_symlink() or not path.is_file()
+                        or path.read_text(encoding="utf-8")!=blob):
+                    raise ValueError(
+                        "Another model stage output already owns these original inputs")
+            if hasattr(os,"O_DIRECTORY"):
+                directory=os.open(self.root,os.O_RDONLY|os.O_DIRECTORY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
         finally:
             if os.path.exists(tmp):
                 os.unlink(tmp)

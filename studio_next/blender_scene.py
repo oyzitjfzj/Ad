@@ -175,9 +175,16 @@ def validate_blender_shot(job, *, verified_assets_root=None):
     return job
 
 
-def render_blender_shot(job, out: Path, *, verified_assets_root=None):
+def render_blender_shot(job, out: Path, *, verified_assets_root=None,
+                        original_exr_passes=False, frame_start=None, frame_end=None):
     """This entry point must run under installed Blender, never eval model code."""
     validate_blender_shot(job,verified_assets_root=verified_assets_root)
+    # Validate the ACTUAL full authored scene before building any subset.
+    # This changes execution granularity, never the artist's animation clock.
+    if frame_start is not None or frame_end is not None:
+        if (type(frame_start) is not int or type(frame_end) is not int or
+                not 1 <= frame_start <= frame_end <= job["frames"]):
+            raise Invalid3DShot("Render range must be an ordered inclusive subset of original shot")
     import bpy
     from math import radians
     from mathutils import Vector
@@ -194,11 +201,22 @@ def render_blender_shot(job, out: Path, *, verified_assets_root=None):
     scene.render.resolution_x=job["width"]
     scene.render.resolution_y=job["height"]
     scene.render.resolution_percentage=100
-    scene.render.film_transparent=False
-    scene.render.image_settings.file_format="PNG"
-    scene.render.image_settings.color_mode="RGB"
-    scene.frame_start=1
-    scene.frame_end=job["frames"]
+    scene.render.film_transparent=bool(original_exr_passes)
+    if original_exr_passes:
+        scene.render.image_settings.file_format="OPEN_EXR_MULTILAYER"
+        scene.render.image_settings.color_mode="RGBA"
+        scene.render.image_settings.color_depth="32"
+        scene.render.image_settings.exr_codec="ZIP"
+        layer=scene.view_layers[0]
+        layer.use_pass_z=True
+        layer.use_pass_vector=True
+        layer.use_pass_normal=True
+        layer.use_pass_diffuse_color=True
+    else:
+        scene.render.image_settings.file_format="PNG"
+        scene.render.image_settings.color_mode="RGB"
+    scene.frame_start=1 if frame_start is None else frame_start
+    scene.frame_end=job["frames"] if frame_end is None else frame_end
     scene.render.fps=job["fps"]
     world=bpy.data.worlds.new("ZX7 director-owned world")
     scene.world=world
@@ -307,7 +325,9 @@ def render_blender_shot(job, out: Path, *, verified_assets_root=None):
     scene.render.filepath=str(out/"frame_")
     bpy.ops.render.render(animation=True)
     return {"shot_id":job["shot_id"],"frames":job["frames"],"fps":job["fps"],
-            "format":"PNG sequence; video encoding requires reviewed FFmpeg adapter",
+            "format":("scene-linear multilayer 32-bit float OpenEXR RGBA, depth, normal and vector"
+                      if original_exr_passes else
+                      "PNG sequence; video encoding requires reviewed FFmpeg adapter"),
             "renderer":"real Blender Cycles CPU 3D; artistic quality not certified"}
 
 
@@ -316,10 +336,18 @@ def main():
     p.add_argument("--scene",type=Path,required=True)
     p.add_argument("--out",type=Path,required=True)
     p.add_argument("--assets-root",type=Path,default=None)
+    p.add_argument("--exr-passes",action="store_true",
+                   help="Physical 32-bit float linear multi-pass VFX EXR instead of display PNG")
+    p.add_argument("--frame-start",type=int,default=None,
+                   help="Original 1-based absolute render frame start (inclusive)")
+    p.add_argument("--frame-end",type=int,default=None,
+                   help="Original 1-based absolute render frame end (inclusive)")
     import sys
     args=p.parse_args(sys.argv[sys.argv.index("--")+1:] if "--" in sys.argv else None)
     job=json.loads(args.scene.read_text(encoding="utf-8"))
-    print(json.dumps(render_blender_shot(job,args.out,verified_assets_root=args.assets_root),
+    print(json.dumps(render_blender_shot(job,args.out,verified_assets_root=args.assets_root,
+                 original_exr_passes=args.exr_passes,
+                 frame_start=args.frame_start,frame_end=args.frame_end),
                      indent=2),flush=True)
 
 

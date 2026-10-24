@@ -80,6 +80,23 @@ class IndependentLocalCreativeServiceTests(unittest.TestCase):
                 self.assertEqual(owner.inspect("film-a")["attempts"],2)
             finally:owner.close()
 
+    def test_studio_host_denies_linked_owner_workspaces(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder)
+            approved=root/"real-studio"
+            approved.mkdir()
+            linked=root/"external"
+            linked.symlink_to(approved,target_is_directory=True)
+            with self.assertRaisesRegex(ValueError,"filesystem link"):
+                LocalBodyCoordinator(linked,execute=lambda p,w:{"status":"blocked"})
+            for name in ("body-service.lock","body-jobs.sqlite3","projects"):
+                with self.subTest(name=name):
+                    alias=approved/name
+                    alias.symlink_to(root/"other-artist-files")
+                    with self.assertRaisesRegex(ValueError,"filesystem link"):
+                        LocalBodyCoordinator(approved,execute=lambda p,w:{"status":"blocked"})
+                    alias.unlink()
+
     def test_one_process_owns_same_original_workspace_at_a_time(self):
         with tempfile.TemporaryDirectory() as root:
             first=LocalBodyCoordinator(root,execute=lambda ir,path:{
@@ -248,20 +265,98 @@ class IndependentLocalCreativeServiceTests(unittest.TestCase):
     def test_api_exposes_actual_stored_tool_progress_not_invented_percent(self):
         with tempfile.TemporaryDirectory() as root:
             from studio_next.durable_graph import DurableFilmGraph
-            service=LocalBodyCoordinator(root,execute=lambda ir,w:{
-                "status":"all_tool_results_verified","completed":[]})
+            entered=threading.Event()
+            release=threading.Event()
+            def genuine_coordinator_race(ir,w):
+                entered.set()
+                if not release.wait(8):
+                    raise RuntimeError("Test did not release actual coordinator")
+                return {"status":"all_tool_results_verified","completed":[]}
+            service=LocalBodyCoordinator(root,execute=genuine_coordinator_race)
             try:
                 directory=service._workspace("evidence");directory.mkdir()
                 ledger=DurableFilmGraph(directory/"production.sqlite3")
-                ledger.start_or_reuse("original-key","shotA","shaA",
+                from studio_next.durable_graph import durable_project_key
+                key=durable_project_key(plan(),fact_ids=set(),
+                         allowed_access={"read","write"})
+                ledger.start_or_reuse(key,"render","shaA",
                     trusted_idempotent=True,
                     existing_result_verifier=lambda _:True,lease_seconds=120)
                 service.submit(plan(),workspace_id="evidence",job_id="evidence-job")
+                self.assertTrue(entered.wait(4),"Real worker never entered")
+                self.assertEqual(service.inspect("evidence-job")["status"],"running")
                 state=service.inspect("evidence-job")["actual_tool_progress"]
                 self.assertTrue(state["tool_progress_is_actual_sqlite"])
-                self.assertEqual(state["observed_tool_states"][0]["node_id"],"shotA")
+                self.assertEqual(state["observed_tool_states"][0]["node_id"],"render")
                 self.assertEqual(state["observed_tool_states"][0]["state"],"running")
-            finally:service.close()
+                self.assertEqual(state["stage_scope"],
+                    "verified_shared_project_lineage_not_single_job_attempt")
+                release.set()
+                for _ in range(150):
+                    if service.inspect("evidence-job")["status"]=="completed":
+                        break
+                    time.sleep(.01)
+                self.assertEqual(service.inspect("evidence-job")["status"],"completed")
+                # The fake executor has no signed graph result/project key.
+                # A completed job may not claim another attempt's stage cache.
+                self.assertFalse(service.inspect("evidence-job")
+                                 ["actual_tool_progress"]["tool_progress_is_actual_sqlite"])
+            finally:
+                release.set()
+                service.close()
+
+
+    def test_two_projects_same_workspace_never_mix_unrelated_stages(self):
+        from studio_next.durable_graph import DurableFilmGraph,durable_project_key
+        with tempfile.TemporaryDirectory() as root:
+            service=LocalBodyCoordinator(root,execute=lambda ir,w:{
+                 "status":"all_tool_results_verified","completed":[]})
+            try:
+                folder=service._workspace("shared-editor")
+                folder.mkdir(parents=True,exist_ok=True)
+                plan_a=plan()
+                plan_b=plan()
+                plan_b["project"]={"creative_intent":"Entirely independent other owner's storyboard"}
+                plan_b["tool_graph"][0]["id"]="render"
+                akey=durable_project_key(plan_a,fact_ids=set(),
+                        allowed_access={"read","write"})
+                bkey=durable_project_key(plan_b,fact_ids=set(),
+                        allowed_access={"read","write"})
+                self.assertNotEqual(akey,bkey)
+                ledger=DurableFilmGraph(folder/"production.sqlite3")
+                ledger.start_or_reuse(akey,"render","sha-original",
+                    trusted_idempotent=True,
+                    existing_result_verifier=lambda _:True,lease_seconds=120)
+                ledger.start_or_reuse(bkey,"render","sha-other",
+                    trusted_idempotent=True,
+                    existing_result_verifier=lambda _:True,lease_seconds=120)
+                service.submit(plan_a,workspace_id="shared-editor",job_id="film-a")
+                service.submit(plan_b,workspace_id="shared-editor",job_id="film-b")
+                for _ in range(200):
+                    if all(service.inspect(job)["status"]=="completed"
+                           for job in ("film-a","film-b")):break
+                    time.sleep(.01)
+                # The mocked executor contains no runtime lineage receipt:
+                # project DB stages must NOT be laundered as job evidence.
+                for job in ("film-a","film-b"):
+                    snap=service.inspect(job)["actual_tool_progress"]
+                    self.assertFalse(snap["tool_progress_is_actual_sqlite"])
+                    self.assertEqual(snap["observed_tool_states"],[])
+                with service._connect() as db:
+                    db.execute("UPDATE jobs SET status='running',result=NULL WHERE id='film-a'")
+                a=service.inspect("film-a")["actual_tool_progress"]
+                self.assertEqual(len(a["observed_tool_states"]),1)
+                self.assertEqual(a["observed_tool_states"][0]["node_id"],"render")
+                with service._connect() as db:
+                    db.execute("UPDATE jobs SET status='queued',result=NULL WHERE id='film-a'")
+                    db.execute("UPDATE jobs SET status='running',result=NULL WHERE id='film-b'")
+                self.assertEqual(service.inspect("film-a")["actual_tool_progress"]
+                                 ["observed_tool_states"],[])
+                b=service.inspect("film-b")["actual_tool_progress"]
+                self.assertEqual(len(b["observed_tool_states"]),1)
+                self.assertEqual(b["observed_tool_states"][0]["node_id"],"render")
+            finally:
+                service.close()
 
     def test_whole_independent_studio_service_survives_original_machine_loss(self):
         import shutil
